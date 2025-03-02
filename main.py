@@ -9,6 +9,7 @@ import numpy as np
 from torchvision import transforms as T
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 from jaxopt import LBFGS
+import copy
 
 from space_groups import PlaneGroup
 from tile import Tile, TileConfig
@@ -29,7 +30,8 @@ def apply_pattern_flow(pattern: Pattern, flow: EquivariantFlow, vector_field: ca
         New pattern with transformed vertices
     """
     # Get all vertices and their tile associations
-    all_vertices, tile_indices = pattern.get_all_vertices()
+    pattern_copy = copy.deepcopy(pattern)
+    all_vertices, tile_indices = pattern_copy.get_all_vertices()
     
     # Apply diagonal flow to all vertices at once
     transformed_vertices = flow.integrate_left_right(vector_field, all_vertices)
@@ -319,7 +321,6 @@ def main():
                 person_points = preprocess_boundary_points(boundary_points)
                 
                 _, loss = flow_optimizer.update(person_points)
-                jax.debug.print("loss: {x:.4f}", x=loss)
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
                 transformed_pattern = apply_pattern_flow(pattern, flow, learned_vector_field)
                 

@@ -1,0 +1,22 @@
+version: '3'
+
+services:
+  kirigami:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kirigami:gpu
+    container_name: kirigami-gpu
+    volumes:
+      - ./:/app
+      - ./output:/app/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: /bin/bash
+    stdin_open: true
+    tty: true 

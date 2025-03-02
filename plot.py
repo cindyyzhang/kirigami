@@ -39,14 +39,6 @@ def plot_tiling(pattern: Pattern,
     
     # Plot each tile
     for idx, tile in enumerate(tiled_tiles):
-        
-        # Plot the base tile shape with scaled vertices
-        # ax.fill(scaled_vertices[:, 0], scaled_vertices[:, 1], 
-        #         color=tile_color, alpha=0.3)
-                
-        # Plot the pore with scaled inner points
-        # ax.fill(scaled_inner[:, 0], scaled_inner[:, 1], 
-        #         color=pore_color, alpha=0.5)
 
         # Plot boundaries - append first point to close the loop
         vertices_closed = np.vstack((tile.vertices, tile.vertices[0]))
@@ -72,8 +64,6 @@ def plot_tiling(pattern: Pattern,
     # Set equal aspect ratio and remove axes
     ax.set_aspect('equal')
     ax.axis('off')
-    
-    # Ensure the black background extends to the edges
     ax.margins(0)
     
     # Save the figure if a save path is provided
