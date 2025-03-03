@@ -156,17 +156,18 @@ def flow_loss(params, tile_points, person_points, flow):
     # Rescale transformed tile to match person's scale and centroid
     T_scaled = (transformed_tile_points - centroid_T) * scale_ratio + centroid_P
     
-    # Compute costs for all possible shifts
-    def compute_shift_cost(shift):
-        shifted_person = jnp.roll(person_points, shift, axis=0)
-        return jnp.sum((T_scaled - shifted_person) ** 2)
+    # # Compute costs for all possible shifts
+    # def compute_shift_cost(shift):
+    #     shifted_person = jnp.roll(person_points, shift, axis=0)
+    #     return jnp.sum((T_scaled - shifted_person) ** 2)
     
-    # Vectorize over all possible shifts
-    shifts = jnp.arange(len(person_points))
-    all_costs = jax.vmap(compute_shift_cost)(shifts)
+    # # Vectorize over all possible shifts
+    # shifts = jnp.arange(len(person_points))
+    # all_costs = jax.vmap(compute_shift_cost)(shifts)
     
-    # Return minimum cost over all shifts
-    return jnp.min(all_costs)
+    # # Return minimum cost over all shifts
+    # return jnp.min(all_costs)
+    return jnp.sum((T_scaled - person_points) ** 2)
 
 class FlowOptimizer:
     """Wrapper class to handle optimization with changing target points"""
@@ -190,7 +191,7 @@ class FlowOptimizer:
         # Create optimizer without state parameter
         self.optimizer = LBFGS(
             fun=opt_wrapper,
-            maxiter=50, 
+            maxiter=100, 
             tol=1e-6,
         )
         # Initialize optimizer state
@@ -230,9 +231,9 @@ def main():
     # Define configurations for the flow and the tile.
     flow_config = FlowConfig(
         num_feats=50,
-        lengthscale=1.0,
+        lengthscale=0.8,
         timescale=1.0,
-        amplitude=0.6,
+        amplitude=0.4,
         duration=1.0,
         num_steps=100,
         start_time=0.01
@@ -244,7 +245,7 @@ def main():
     )
     
     # Create a plane group
-    group = PlaneGroup(3)
+    group = PlaneGroup(4)
     
     # Create an instance of EquivariantFlow
     flow = EquivariantFlow(group, flow_config)
@@ -272,10 +273,14 @@ def main():
     # Set up display window for the flow pattern
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111)
-    plt.ion()  # Turn on interactive mode for live updates
+    plt.ion()
 
     # Initialize flow optimizer
     flow_optimizer = FlowOptimizer(flow, tile_points, flow.params)
+    
+    # Frame processing parameters
+    process_every_n_frames = 10  # Only process every 10th frame
+    frame_count = 0
     
     while True:
         ret, frame = cap.read()
@@ -283,6 +288,16 @@ def main():
             print("Failed to grab frame")
             break
         
+        # Always display the current frame for smooth video
+        cv2.imshow('Webcam', frame)
+        
+        # Only process certain frames
+        frame_count += 1
+        if frame_count % process_every_n_frames != 0:
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
+            
         # Convert frame from BGR to RGB
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -338,9 +353,6 @@ def main():
         
         # Display the webcam feed with points
         cv2.imshow("Webcam Segmentation", blended)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
     
     # Clean up
     cap.release()
