@@ -123,30 +123,38 @@ def flow_loss(params, tile_points, person_points, flow):
     Returns:
         Loss value measuring minimum discrepancy over all possible shifts
     """
-    def vector_field_param(xy, t, params):
+    # Define vector field based on parameters
+    def vector_field_param(xy, t):
         op_uv = jax.vmap(
             lambda op: flow._apply_operation(flow.base_function, params, xy, t, op)
         )(flow.operations)
         return jnp.mean(op_uv, axis=0)
     
-    # Integrate tile points with current parameters
-    times = jnp.linspace(0, flow.config.duration, flow.config.num_steps)
-    transformed = jax.experimental.ode.odeint(
-        lambda xy, t: vector_field_param(xy, t, params),
-        tile_points[jnp.newaxis, :, :],
-        times
-    )
-    T = transformed[-1][0]  # Final transformed points
+    # Vectorized integration over all points at once
+    config = flow.config
+    times = jnp.linspace(config.start_time, config.duration, config.num_steps)
+    
+    # Use odeint to integrate all points at once
+    transformed_trajectory = jax.vmap(
+        lambda point: jax.experimental.ode.odeint(
+            lambda p, t: vector_field_param(p, t), 
+            point, 
+            times
+        )
+    )(tile_points)
+    
+    # Get the final state of each point
+    transformed_tile_points = transformed_trajectory[:, -1, :]
     
     # Compute centroids and average scales
-    centroid_T = jnp.mean(T, axis=0)
+    centroid_T = jnp.mean(transformed_tile_points, axis=0)
     centroid_P = jnp.mean(person_points, axis=0)
-    scale_T = jnp.mean(jnp.linalg.norm(T - centroid_T, axis=1))
+    scale_T = jnp.mean(jnp.linalg.norm(transformed_tile_points - centroid_T, axis=1))
     scale_P = jnp.mean(jnp.linalg.norm(person_points - centroid_P, axis=1))
     scale_ratio = scale_P / scale_T
     
     # Rescale transformed tile to match person's scale and centroid
-    T_scaled = (T - centroid_T) * scale_ratio + centroid_P
+    T_scaled = (transformed_tile_points - centroid_T) * scale_ratio + centroid_P
     
     # Compute costs for all possible shifts
     def compute_shift_cost(shift):
@@ -175,17 +183,15 @@ class FlowOptimizer:
         # Create optimizer with a wrapper function that uses the current target
         def opt_wrapper(params):
             # Use a dummy target for initialization
-            dummy_target = jnp.zeros((64, 2))  # Assuming 64 points in 2D
+            dummy_target = jnp.zeros((64, 2))
             target = self.current_target if self.current_target is not None else dummy_target
             return self.loss_fn(params, target)
         
         # Create optimizer without state parameter
         self.optimizer = LBFGS(
             fun=opt_wrapper,
-            maxiter=1,  # Changed from 100 to 1
+            maxiter=50, 
             tol=1e-6,
-            maxls=4,  # Limit line search steps
-            history_size=10  # Smaller history size for more frequent updates
         )
         # Initialize optimizer state
         self.opt_state = self.optimizer.init_state(init_params)
@@ -238,7 +244,7 @@ def main():
     )
     
     # Create a plane group
-    group = PlaneGroup(2)
+    group = PlaneGroup(3)
     
     # Create an instance of EquivariantFlow
     flow = EquivariantFlow(group, flow_config)
