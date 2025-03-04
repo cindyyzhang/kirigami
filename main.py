@@ -72,16 +72,31 @@ def get_boundary(mask, num_points=64):
     """
     # Convert boolean mask to uint8 image (values 0 or 255)
     mask_uint8 = (mask.astype(np.uint8) * 255)
-    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    
+    # Use CHAIN_APPROX_SIMPLE to reduce the number of points in contours
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     if len(contours) == 0:
         return None
+        
     # Select the largest contour by area
     largest_contour = max(contours, key=cv2.contourArea)
+    
+    # If contour is too small, return None to avoid processing noise
+    if cv2.contourArea(largest_contour) < 500:  # Minimum area threshold
+        return None
+        
     largest_contour = largest_contour.squeeze()  # shape (N,2)
+    
     if largest_contour.ndim == 1:
         largest_contour = largest_contour[np.newaxis, :]
+        
+    # Use approximate contour to reduce points before sampling
+    epsilon = 0.005 * cv2.arcLength(largest_contour.reshape(-1, 1, 2), True)
+    approx_contour = cv2.approxPolyDP(largest_contour.reshape(-1, 1, 2), epsilon, True).squeeze()
+    
     # Sample 64 evenly spaced points along the contour
-    points = sample_contour_points(largest_contour, num_points)
+    points = sample_contour_points(approx_contour, num_points)
     return points
 
 def preprocess_boundary_points(points):
@@ -91,14 +106,22 @@ def preprocess_boundary_points(points):
     if points is None:
         return None
     
+    # Use JAX operations directly for better GPU utilization
+    points_jax = jnp.array(points)
+    
     # Center the points around origin
-    center = np.mean(points, axis=0)
-    centered_points = points - center
+    center = jnp.mean(points_jax, axis=0)
+    centered_points = points_jax - center
     
     # Scale to similar range as the simulated circle (radius ~1)
-    max_dist = np.max(np.sqrt(np.sum(centered_points**2, axis=1)))
-    normalized_points = centered_points / max_dist if max_dist > 0 else centered_points
-    return jnp.array(normalized_points)
+    squared_distances = jnp.sum(centered_points**2, axis=1)
+    max_dist = jnp.sqrt(jnp.max(squared_distances))
+    
+    # Avoid division by zero
+    scale_factor = jnp.where(max_dist > 0, 1.0 / max_dist, 1.0)
+    normalized_points = centered_points * scale_factor
+    
+    return normalized_points
 
 class FlowOptimizer:
     """Wrapper class to handle optimization with changing target points"""
@@ -152,13 +175,14 @@ class FlowOptimizer:
             target = self.current_target if self.current_target is not None else dummy_target
             return self.loss_fn(params, target)
         
-        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-6)
+        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-5)
         self.opt_state = self.optimizer.init_state(init_params)
         self.params = init_params
         self.initial_params = init_params
     
     def update(self, target_points):
         """Perform one optimization step with new target points"""
+            
         self.current_target = target_points
         old_params = self.params
 
@@ -169,8 +193,9 @@ class FlowOptimizer:
         param_diff = jnp.abs(self.params - old_params).mean()
         loss = self.loss_fn(self.params, target_points)
         
-        jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
-        jax.debug.print("Current loss: {loss:.4f}", loss=loss)
+        # jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
+        # jax.debug.print("Current loss: {loss:.4f}", loss=loss)
+            
         return self.params, loss
 
 def main():
@@ -206,19 +231,32 @@ def main():
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
     model.to(device)
     model.eval()
+    
+    # Optimize model with TorchScript if on CUDA
+    if device.type == 'cuda':
+        model = torch.jit.script(model)
+    
     transform = T.Compose([T.ToTensor()])
     
     # Open a connection to the webcam
     cap = cv2.VideoCapture(0)
-    print("Starting webcam segmentation. Press 'q' to exit.")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    print("Starting webcam segmentation.")
     
     # Set up display window for the flow pattern
-    fig = plt.figure(figsize=(10, 10))
+    fig = plt.figure(figsize=(15, 10))
     ax = fig.add_subplot(111)
     plt.ion()
 
     # Initialize flow optimizer
     flow_optimizer = FlowOptimizer(flow, tile_points, flow.params)
+    
+    # Variables for frame skipping and processing
+    frame_count = 0
+    process_every_n_frames = 2  # Process every 2nd frame for segmentation
+    last_mask = None
+    last_boundary_points = None
+    mask_overlay = None
     
     while True:
         ret, frame = cap.read()
@@ -226,44 +264,62 @@ def main():
             print("Failed to grab frame")
             break
         
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image_tensor = transform(image).to(device)
-        with torch.no_grad():
-            predictions = model([image_tensor])
-        prediction = predictions[0]
+        # Only process every n frames for segmentation to reduce computational load
+        process_this_frame = (frame_count % process_every_n_frames == 0)
+        frame_count += 1
         
-        # Filter out detections for persons
-        person_indices = [i for i, label in enumerate(prediction['labels'].cpu().numpy()) 
-                          if label == 1 and prediction['scores'][i] > 0.7]
+        if process_this_frame:
+            # Convert to RGB and process with model
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_tensor = transform(image).to(device)
+            
+            with torch.no_grad():
+                predictions = model([image_tensor])
+            prediction = predictions[0]
+            
+            # Filter out detections for persons
+            person_indices = [i for i, label in enumerate(prediction['labels'].cpu().numpy()) 
+                            if label == 1 and prediction['scores'][i] > 0.7]
+            
+            if person_indices:
+                # Choose the person with the largest mask area
+                max_area = 0
+                main_person_index = person_indices[0]
+                for i in person_indices:
+                    mask_i = prediction['masks'][i, 0].cpu().numpy()
+                    binary_mask = mask_i > 0.5
+                    area = np.sum(binary_mask)
+                    if area > max_area:
+                        max_area = area
+                        main_person_index = i
+                
+                # Get mask and update last_mask
+                last_mask = prediction['masks'][main_person_index, 0].cpu().numpy() > 0.5
+                
+                # Extract boundary points (only when processing a frame)
+                if last_mask is not None:
+                    last_boundary_points = get_boundary(last_mask)
+            else:
+                last_mask = None
+                last_boundary_points = None
         
-        mask = None
-        if person_indices:
-            # Choose the person with the largest mask area
-            max_area = 0
-            main_person_index = person_indices[0]
-            for i in person_indices:
-                mask_i = prediction['masks'][i, 0].cpu().numpy()
-                binary_mask = mask_i > 0.5
-                area = np.sum(binary_mask)
-                if area > max_area:
-                    max_area = area
-                    main_person_index = i
-            
-            mask = prediction['masks'][main_person_index, 0].cpu().numpy() > 0.5
-            
-            # Create a colored overlay for the mask on the original frame
-            colored_mask = np.zeros_like(frame, dtype=np.uint8)
-            colored_mask[mask] = (0, 255, 0)  # Green color in BGR
-            blended = cv2.addWeighted(frame, 1.0, colored_mask, 0.5, 0)
+        # Always display the most recent mask (even on frames we don't process)
+        if last_mask is not None:
+            if mask_overlay is None or mask_overlay.shape != frame.shape:
+                mask_overlay = np.zeros_like(frame, dtype=np.uint8)
+            else:
+                mask_overlay.fill(0)  # Clear the buffer
+                
+            mask_overlay[last_mask] = (0, 255, 0)  # Green color in BGR
+            blended = cv2.addWeighted(frame, 1.0, mask_overlay, 0.5, 0)
         else:
             blended = frame
         
-        # Extract and process boundary points when a mask is available
-        if mask is not None:
-            boundary_points = get_boundary(mask)
-            if boundary_points is not None:
-                person_points = preprocess_boundary_points(boundary_points)
-                
+
+        if process_this_frame and last_boundary_points is not None:
+            person_points = preprocess_boundary_points(last_boundary_points)
+            
+            if person_points is not None:
                 # Update the flow optimizer with the new target points
                 _, loss = flow_optimizer.update(person_points)
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
@@ -277,6 +333,7 @@ def main():
         
         # Display the webcam feed with points
         cv2.imshow("Webcam Segmentation", blended)
+        key = cv2.waitKey(1) & 0xFF
     
     cap.release()
     cv2.destroyAllWindows()
