@@ -19,18 +19,8 @@ from plot import plot_tiling
 def apply_pattern_flow(pattern: Pattern, flow: EquivariantFlow, vector_field: callable) -> Pattern:
     """
     Applies diagonal flow slicing to entire pattern.
-    
-    Args:
-        pattern: The input pattern
-        flow: EquivariantFlow instance
-        vector_field: Vector field to integrate
-        
-    Returns:
-        New pattern with transformed vertices
     """
-    # Get all vertices and their tile associations
-    pattern_copy = copy.deepcopy(pattern)
-    all_vertices, tile_indices = pattern_copy.get_all_vertices()
+    all_vertices, tile_indices = pattern.get_all_vertices()
     
     # Apply diagonal flow to all vertices at once
     transformed_vertices = flow.integrate_left_right(vector_field, all_vertices)
@@ -60,7 +50,6 @@ def sample_contour_points(contour, num_points=64):
         if idx == 0:
             sampled_points.append(contour[0])
         else:
-            # Interpolate linearly between contour[idx-1] and contour[idx]
             t = (d - cumdist[idx-1]) / (cumdist[idx] - cumdist[idx-1])
             point = (1 - t) * contour[idx - 1] + t * contour[idx]
             sampled_points.append(point)
@@ -70,10 +59,7 @@ def get_boundary(mask, num_points=64):
     """
     Given a binary mask (2D array), extract the largest contour and sample 64 points along it.
     """
-    # Convert boolean mask to uint8 image (values 0 or 255)
     mask_uint8 = (mask.astype(np.uint8) * 255)
-    
-    # Use CHAIN_APPROX_SIMPLE to reduce the number of points in contours
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if len(contours) == 0:
@@ -86,17 +72,9 @@ def get_boundary(mask, num_points=64):
     if cv2.contourArea(largest_contour) < 500:  # Minimum area threshold
         return None
         
-    largest_contour = largest_contour.squeeze()  # shape (N,2)
-    
-    if largest_contour.ndim == 1:
-        largest_contour = largest_contour[np.newaxis, :]
-        
-    # Use approximate contour to reduce points before sampling
-    epsilon = 0.005 * cv2.arcLength(largest_contour.reshape(-1, 1, 2), True)
-    approx_contour = cv2.approxPolyDP(largest_contour.reshape(-1, 1, 2), epsilon, True).squeeze()
-    
-    # Sample 64 evenly spaced points along the contour
-    points = sample_contour_points(approx_contour, num_points)
+    largest_contour = largest_contour.squeeze()
+    # Sample 64 points along the contour
+    points = sample_contour_points(largest_contour, num_points)
     return points
 
 def preprocess_boundary_points(points):
@@ -105,22 +83,17 @@ def preprocess_boundary_points(points):
     """
     if points is None:
         return None
-    
-    # Use JAX operations directly for better GPU utilization
-    points_jax = jnp.array(points)
+    points = jnp.array(points)
     
     # Center the points around origin
-    center = jnp.mean(points_jax, axis=0)
-    centered_points = points_jax - center
+    center = jnp.mean(points, axis=0)
+    centered_points = points - center
     
     # Scale to similar range as the simulated circle (radius ~1)
     squared_distances = jnp.sum(centered_points**2, axis=1)
     max_dist = jnp.sqrt(jnp.max(squared_distances))
-    
-    # Avoid division by zero
     scale_factor = jnp.where(max_dist > 0, 1.0 / max_dist, 1.0)
     normalized_points = centered_points * scale_factor
-    
     return normalized_points
 
 class FlowOptimizer:
@@ -143,7 +116,7 @@ class FlowOptimizer:
         
         @jax.jit
         def flow_loss(params, target_points):
-            # Transform points using the flow
+            # Push points forward in time
             transformed = jax.experimental.ode.odeint(
                 lambda xy, t: vector_field_param(params, xy, t),
                 self.tile_points,
@@ -193,10 +166,20 @@ class FlowOptimizer:
         param_diff = jnp.abs(self.params - old_params).mean()
         loss = self.loss_fn(self.params, target_points)
         
-        # jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
-        # jax.debug.print("Current loss: {loss:.4f}", loss=loss)
+        jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
+        jax.debug.print("Current loss: {loss:.4f}", loss=loss)
             
-        return self.params, loss
+        return self.params, loss, param_diff
+
+    def reset_optimizer(self, add_noise: bool = False, noise_scale: float = 1e-3):
+        """
+        Resets the LBFGS optimizer state with the current parameters.
+        """
+        if add_noise:
+            key = jax.random.PRNGKey(0)
+            noise = noise_scale * jax.random.normal(key, self.params.shape)
+            self.params = self.params + noise
+        self.opt_state = self.optimizer.init_state(self.params)
 
 def main():
     # Define configurations for the flow and the tile.
@@ -214,14 +197,12 @@ def main():
         boundary_offset=0.1,
         inner_offset=0.2
     )
-    group = PlaneGroup(4) 
+    group = PlaneGroup(4) # pg
     flow = EquivariantFlow(group, flow_config)
     
-    # Generate a tile from the fundamental region
+    # Generate a tile from the fundamental region and create a tiling pattern
     tile = Tile.from_fundamental_region(group, tile_config)
     tile_points = tile.boundary
-    
-    # Create a pattern with the original tile
     pattern = Pattern(group, width=6, height=4)
     pattern.add_tile(tile)
     pattern.generate_tiling()
@@ -231,11 +212,6 @@ def main():
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
     model.to(device)
     model.eval()
-    
-    # Optimize model with TorchScript if on CUDA
-    if device.type == 'cuda':
-        model = torch.jit.script(model)
-    
     transform = T.Compose([T.ToTensor()])
     
     # Open a connection to the webcam
@@ -258,13 +234,21 @@ def main():
     last_boundary_points = None
     mask_overlay = None
     
+    # Variables to track optimization progress
+    optimization_steps = 0
+    reset_every_n_steps = 50  # Reset optimizer every 50 steps
+    min_loss_threshold = 0.01  # Consider optimization converged below this loss
+    consecutive_small_changes = 0
+    small_change_threshold = 1e-4  # Parameter change threshold
+    max_consecutive_small_changes = 10  # Reset after this many small changes
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame")
             break
         
-        # Only process every n frames for segmentation to reduce computational load
+        # Only process every n frames for segmentation
         process_this_frame = (frame_count % process_every_n_frames == 0)
         frame_count += 1
         
@@ -321,7 +305,26 @@ def main():
             
             if person_points is not None:
                 # Update the flow optimizer with the new target points
-                _, loss = flow_optimizer.update(person_points)
+                params, loss, param_diff = flow_optimizer.update(person_points)
+                optimization_steps += 1
+
+                if param_diff < small_change_threshold:
+                    consecutive_small_changes += 1
+                else:
+                    consecutive_small_changes = 0
+                
+                # Reset optimizer if:
+                # 1. We've done reset_every_n_steps optimization steps, or
+                # 2. We've had max_consecutive_small_changes small parameter changes, or
+                # 3. Loss is very small (converged to good solution)
+                if (optimization_steps % reset_every_n_steps == 0 or 
+                    consecutive_small_changes >= max_consecutive_small_changes or
+                    loss < min_loss_threshold):
+                    print(f"Resetting optimizer. Steps: {optimization_steps}, Loss: {loss:.4f}")
+                    # Add small noise to escape local minimum
+                    flow_optimizer.reset_optimizer(add_noise=True, noise_scale=4e-3)
+                    consecutive_small_changes = 0
+                
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
                 transformed_pattern = apply_pattern_flow(pattern, flow, learned_vector_field)
                 
