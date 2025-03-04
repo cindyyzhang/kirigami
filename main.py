@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import jax.random as jrnd
 import matplotlib.pyplot as plt
 import torch
 import torchvision
@@ -88,12 +87,6 @@ def get_boundary(mask, num_points=64):
 def preprocess_boundary_points(points):
     """
     Normalize and center the boundary points to prepare them for the flow algorithm.
-    
-    Args:
-        points: NumPy array of boundary points from webcam segmentation
-        
-    Returns:
-        JAX array of normalized points
     """
     if points is None:
         return None
@@ -105,126 +98,79 @@ def preprocess_boundary_points(points):
     # Scale to similar range as the simulated circle (radius ~1)
     max_dist = np.max(np.sqrt(np.sum(centered_points**2, axis=1)))
     normalized_points = centered_points / max_dist if max_dist > 0 else centered_points
-    
-    # Convert to JAX array
     return jnp.array(normalized_points)
-
-def flow_loss(params, tile_points, person_points, flow):
-    """
-    Compute loss between transformed tile points and target person points,
-    considering all possible cyclic shifts of the points.
-    
-    Args:
-        params: Flow parameters to optimize
-        tile_points: Array of shape (64,2) representing the tile's border points
-        person_points: Array of shape (64,2) representing the person outline
-        flow: EquivariantFlow instance
-    
-    Returns:
-        Loss value measuring minimum discrepancy over all possible shifts
-    """
-    # Define vector field based on parameters
-    def vector_field_param(xy, t):
-        op_uv = jax.vmap(
-            lambda op: flow._apply_operation(flow.base_function, params, xy, t, op)
-        )(flow.operations)
-        return jnp.mean(op_uv, axis=0)
-    
-    # Vectorized integration over all points at once
-    config = flow.config
-    times = jnp.linspace(config.start_time, config.duration, config.num_steps)
-    
-    # Use odeint to integrate all points at once
-    transformed_trajectory = jax.vmap(
-        lambda point: jax.experimental.ode.odeint(
-            lambda p, t: vector_field_param(p, t), 
-            point, 
-            times
-        )
-    )(tile_points)
-    
-    # Get the final state of each point
-    transformed_tile_points = transformed_trajectory[:, -1, :]
-    
-    # Compute centroids and average scales
-    centroid_T = jnp.mean(transformed_tile_points, axis=0)
-    centroid_P = jnp.mean(person_points, axis=0)
-    scale_T = jnp.mean(jnp.linalg.norm(transformed_tile_points - centroid_T, axis=1))
-    scale_P = jnp.mean(jnp.linalg.norm(person_points - centroid_P, axis=1))
-    scale_ratio = scale_P / scale_T
-    
-    # Rescale transformed tile to match person's scale and centroid
-    T_scaled = (transformed_tile_points - centroid_T) * scale_ratio + centroid_P
-    
-    # # Compute costs for all possible shifts
-    # def compute_shift_cost(shift):
-    #     shifted_person = jnp.roll(person_points, shift, axis=0)
-    #     return jnp.sum((T_scaled - shifted_person) ** 2)
-    
-    # # Vectorize over all possible shifts
-    # shifts = jnp.arange(len(person_points))
-    # all_costs = jax.vmap(compute_shift_cost)(shifts)
-    
-    # # Return minimum cost over all shifts
-    # return jnp.min(all_costs)
-    return jnp.sum((T_scaled - person_points) ** 2)
 
 class FlowOptimizer:
     """Wrapper class to handle optimization with changing target points"""
     def __init__(self, flow, tile_points, init_params):
         self.flow = flow
-        self.tile_points = tile_points
+        self.tile_points = jax.device_put(tile_points)
+        self.times = jax.device_put(
+            jnp.linspace(flow.config.start_time, flow.config.duration, flow.config.num_steps)
+        )
+        
+        @jax.jit
+        def vector_field_param(params, xy, t):
+            op_uv = jax.vmap(
+                lambda xy: jax.vmap(
+                    lambda op: flow._apply_operation(flow.base_function, params, xy, t, op)
+                )(flow.operations)
+            )(xy)
+            return jnp.mean(op_uv, axis=1)
+        
+        @jax.jit
+        def flow_loss(params, target_points):
+            # Transform points using the flow
+            transformed = jax.experimental.ode.odeint(
+                lambda xy, t: vector_field_param(params, xy, t),
+                self.tile_points,
+                self.times
+            )
+            final_points = transformed[-1]
+            
+            # Scale and center
+            centroid_T = jnp.mean(final_points, axis=0)
+            centroid_P = jnp.mean(target_points, axis=0)
+            scale_T = jnp.mean(jnp.linalg.norm(final_points - centroid_T, axis=1))
+            scale_P = jnp.mean(jnp.linalg.norm(target_points - centroid_P, axis=1))
+            T_scaled = (final_points - centroid_T) * (scale_P / scale_T) + centroid_P
+            
+            # Compute costs for all possible cyclic shifts
+            def compute_shift_cost(shift):
+                shifted_target = jnp.roll(target_points, shift, axis=0)
+                return jnp.sum((T_scaled - shifted_target) ** 2)
+            
+            shifts = jnp.arange(len(target_points))
+            all_costs = jax.vmap(compute_shift_cost)(shifts)
+            return jnp.min(all_costs)
+            
+        self.loss_fn = flow_loss
         self.current_target = None
         
-        # Create a jitted loss function that takes target points as state
-        def loss_with_state(params, target_points):
-            return flow_loss(params, tile_points, target_points, flow)
-        self.loss_fn = jax.jit(loss_with_state)
-        
-        # Create optimizer with a wrapper function that uses the current target
         def opt_wrapper(params):
-            # Use a dummy target for initialization
             dummy_target = jnp.zeros((64, 2))
             target = self.current_target if self.current_target is not None else dummy_target
             return self.loss_fn(params, target)
         
-        # Create optimizer without state parameter
-        self.optimizer = LBFGS(
-            fun=opt_wrapper,
-            maxiter=100, 
-            tol=1e-6,
-        )
-        # Initialize optimizer state
+        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-6)
         self.opt_state = self.optimizer.init_state(init_params)
         self.params = init_params
-        
-        # Store initial parameters for debugging
         self.initial_params = init_params
     
     def update(self, target_points):
         """Perform one optimization step with new target points"""
-        # Update current target
         self.current_target = target_points
-        
-        # Store old parameters for comparison
         old_params = self.params
-        
-        # Do optimization step
+
         self.params, self.opt_state = self.optimizer.update(
             self.params,
             self.opt_state
         )
-        
-        # Compute parameter change for debugging
         param_diff = jnp.abs(self.params - old_params).mean()
-        
-        # Compute loss with current parameters and target
         loss = self.loss_fn(self.params, target_points)
         
-        # Debug prints
         jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
         jax.debug.print("Current loss: {loss:.4f}", loss=loss)
-        
         return self.params, loss
 
 def main():
@@ -243,11 +189,7 @@ def main():
         boundary_offset=0.1,
         inner_offset=0.2
     )
-    
-    # Create a plane group
-    group = PlaneGroup(4)
-    
-    # Create an instance of EquivariantFlow
+    group = PlaneGroup(4) 
     flow = EquivariantFlow(group, flow_config)
     
     # Generate a tile from the fundamental region
@@ -278,33 +220,14 @@ def main():
     # Initialize flow optimizer
     flow_optimizer = FlowOptimizer(flow, tile_points, flow.params)
     
-    # Frame processing parameters
-    process_every_n_frames = 10  # Only process every 10th frame
-    frame_count = 0
-    
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame")
             break
         
-        # Always display the current frame for smooth video
-        cv2.imshow('Webcam', frame)
-        
-        # Only process certain frames
-        frame_count += 1
-        if frame_count % process_every_n_frames != 0:
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
-            
-        # Convert frame from BGR to RGB
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Transform the image and move it to the device
         image_tensor = transform(image).to(device)
-        
-        # Perform inference
         with torch.no_grad():
             predictions = model([image_tensor])
         prediction = predictions[0]
@@ -341,6 +264,7 @@ def main():
             if boundary_points is not None:
                 person_points = preprocess_boundary_points(boundary_points)
                 
+                # Update the flow optimizer with the new target points
                 _, loss = flow_optimizer.update(person_points)
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
                 transformed_pattern = apply_pattern_flow(pattern, flow, learned_vector_field)
@@ -354,7 +278,6 @@ def main():
         # Display the webcam feed with points
         cv2.imshow("Webcam Segmentation", blended)
     
-    # Clean up
     cap.release()
     cv2.destroyAllWindows()
     plt.ioff()
