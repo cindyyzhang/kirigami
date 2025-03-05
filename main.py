@@ -8,7 +8,8 @@ import numpy as np
 from torchvision import transforms as T
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 from jaxopt import LBFGS
-import copy
+import os
+import time
 
 from space_groups import PlaneGroup
 from tile import Tile, TileConfig
@@ -166,20 +167,25 @@ class FlowOptimizer:
         param_diff = jnp.abs(self.params - old_params).mean()
         loss = self.loss_fn(self.params, target_points)
         
-        jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
-        jax.debug.print("Current loss: {loss:.4f}", loss=loss)
+        # jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
+        # jax.debug.print("Current loss: {loss:.4f}", loss=loss)
             
         return self.params, loss, param_diff
 
-    def reset_optimizer(self, add_noise: bool = False, noise_scale: float = 1e-3):
+    def reset_optimizer(self):
         """
-        Resets the LBFGS optimizer state with the current parameters.
+        Resets the LBFGS optimizer state with the initial parameters.
         """
-        if add_noise:
-            key = jax.random.PRNGKey(0)
-            noise = noise_scale * jax.random.normal(key, self.params.shape)
-            self.params = self.params + noise
+        self.params = self.initial_params
         self.opt_state = self.optimizer.init_state(self.params)
+
+def prevent_display_sleep():
+    """Prevent the display from going to sleep."""
+    try:
+        os.system('xset s off -dpms')
+        print("Display sleep prevention enabled on Linux")
+    except Exception as e:
+        print(f"Failed to prevent display sleep on Linux: {e}")
 
 def main():
     # Define configurations for the flow and the tile.
@@ -237,16 +243,22 @@ def main():
     # Variables to track optimization progress
     optimization_steps = 0
     reset_every_n_steps = 50  # Reset optimizer every 50 steps
-    min_loss_threshold = 0.01  # Consider optimization converged below this loss
     consecutive_small_changes = 0
-    small_change_threshold = 1e-4  # Parameter change threshold
+    small_change_threshold = 0.001  # Parameter change threshold
     max_consecutive_small_changes = 10  # Reset after this many small changes
+    
+    prevent_display_sleep()
     
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame")
-            break
+            # Add retry logic for webcam failures
+            cap.release()
+            time.sleep(5)  # Wait 5 seconds before trying to reconnect
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            continue
         
         # Only process every n frames for segmentation
         process_this_frame = (frame_count % process_every_n_frames == 0)
@@ -315,14 +327,11 @@ def main():
                 
                 # Reset optimizer if:
                 # 1. We've done reset_every_n_steps optimization steps, or
-                # 2. We've had max_consecutive_small_changes small parameter changes, or
-                # 3. Loss is very small (converged to good solution)
+                # 2. We've had max_consecutive_small_changes small parameter changes
                 if (optimization_steps % reset_every_n_steps == 0 or 
-                    consecutive_small_changes >= max_consecutive_small_changes or
-                    loss < min_loss_threshold):
+                    consecutive_small_changes >= max_consecutive_small_changes):
                     print(f"Resetting optimizer. Steps: {optimization_steps}, Loss: {loss:.4f}")
-                    # Add small noise to escape local minimum
-                    flow_optimizer.reset_optimizer(add_noise=True, noise_scale=4e-3)
+                    flow_optimizer.reset_optimizer()
                     consecutive_small_changes = 0
                 
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
@@ -337,11 +346,6 @@ def main():
         # Display the webcam feed with points
         cv2.imshow("Webcam Segmentation", blended)
         key = cv2.waitKey(1) & 0xFF
-    
-    cap.release()
-    cv2.destroyAllWindows()
-    plt.ioff()
-    plt.close('all')
 
 if __name__ == "__main__":
     main()
