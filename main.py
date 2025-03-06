@@ -29,7 +29,7 @@ def apply_pattern_flow(pattern: Pattern, flow: EquivariantFlow, vector_field: ca
     # Create new pattern and add new tiles
     new_pattern = Pattern(pattern.group, pattern.width, pattern.height)
     for idx in range(len(transformed_vertices)):
-        new_tile = Tile(transformed_vertices[idx], boundary_offset=0.1, inner_offset=0.1)
+        new_tile = Tile(transformed_vertices[idx], boundary_offset=0.1, inner_offset=0.18)
         new_pattern.add_tile(new_tile)
     return new_pattern
 
@@ -149,27 +149,21 @@ class FlowOptimizer:
             target = self.current_target if self.current_target is not None else dummy_target
             return self.loss_fn(params, target)
         
-        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-5)
+        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-6)
         self.opt_state = self.optimizer.init_state(init_params)
         self.params = init_params
         self.initial_params = init_params
-    
+
     def update(self, target_points):
         """Perform one optimization step with new target points"""
-            
         self.current_target = target_points
         old_params = self.params
-
         self.params, self.opt_state = self.optimizer.update(
             self.params,
             self.opt_state
         )
         param_diff = jnp.abs(self.params - old_params).mean()
         loss = self.loss_fn(self.params, target_points)
-        
-        # jax.debug.print("Parameter change: {diff:.6f}", diff=param_diff)
-        # jax.debug.print("Current loss: {loss:.4f}", loss=loss)
-            
         return self.params, loss, param_diff
 
     def reset_optimizer(self):
@@ -201,7 +195,7 @@ def main():
     tile_config = TileConfig(
         num_points=65,
         boundary_offset=0.1,
-        inner_offset=0.2
+        inner_offset=0.18
     )
     group = PlaneGroup(4) # pg
     flow = EquivariantFlow(group, flow_config)
@@ -209,7 +203,7 @@ def main():
     # Generate a tile from the fundamental region and create a tiling pattern
     tile = Tile.from_fundamental_region(group, tile_config)
     tile_points = tile.boundary
-    pattern = Pattern(group, width=6, height=4)
+    pattern = Pattern(group, width=7, height=4)
     pattern.add_tile(tile)
     pattern.generate_tiling()
     
@@ -223,6 +217,9 @@ def main():
     # Open a connection to the webcam
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Set a lower resolution (1280x720) for faster processing
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     print("Starting webcam segmentation.")
     
     # Set up display window for the flow pattern
@@ -247,10 +244,15 @@ def main():
     small_change_threshold = 0.001  # Parameter change threshold
     max_consecutive_small_changes = 10  # Reset after this many small changes
     
-    prevent_display_sleep()
+    # prevent_display_sleep()
     
     while True:
+        start_time = time.time()  # Start timing the loop
+
+        # Timing for frame capture
+        frame_capture_start = time.time()
         ret, frame = cap.read()
+        
         if not ret:
             print("Failed to grab frame")
             # Add retry logic for webcam failures
@@ -258,12 +260,17 @@ def main():
             time.sleep(5)  # Wait 5 seconds before trying to reconnect
             cap = cv2.VideoCapture(0)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             continue
         
         # Only process every n frames for segmentation
         process_this_frame = (frame_count % process_every_n_frames == 0)
         frame_count += 1
+        frame_capture_end = time.time()
         
+        # Timing for segmentation
+        segmentation_start = time.time()
         if process_this_frame:
             # Convert to RGB and process with model
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -298,25 +305,26 @@ def main():
             else:
                 last_mask = None
                 last_boundary_points = None
-        
-        # Always display the most recent mask (even on frames we don't process)
-        if last_mask is not None:
-            if mask_overlay is None or mask_overlay.shape != frame.shape:
-                mask_overlay = np.zeros_like(frame, dtype=np.uint8)
-            else:
-                mask_overlay.fill(0)  # Clear the buffer
+        segmentation_end = time.time()
+
+        # if last_mask is not None:
+        #     if mask_overlay is None or mask_overlay.shape != frame.shape:
+        #         mask_overlay = np.zeros_like(frame, dtype=np.uint8)
+        #     else:
+        #         mask_overlay.fill(0)  # Clear the buffer
                 
-            mask_overlay[last_mask] = (0, 255, 0)  # Green color in BGR
-            blended = cv2.addWeighted(frame, 1.0, mask_overlay, 0.5, 0)
-        else:
-            blended = frame
-        
+        #     mask_overlay[last_mask] = (0, 255, 0)  # Green color in BGR
+        #     blended = cv2.addWeighted(frame, 1.0, mask_overlay, 0.5, 0)
+        # else:
+        #     blended = frame
 
         if process_this_frame and last_boundary_points is not None:
+            preprocess_start = time.time()
             person_points = preprocess_boundary_points(last_boundary_points)
-            
+            preprocess_end = time.time()
             if person_points is not None:
                 # Update the flow optimizer with the new target points
+                optimization_start = time.time()
                 params, loss, param_diff = flow_optimizer.update(person_points)
                 optimization_steps += 1
 
@@ -333,19 +341,33 @@ def main():
                     print(f"Resetting optimizer. Steps: {optimization_steps}, Loss: {loss:.4f}")
                     flow_optimizer.reset_optimizer()
                     consecutive_small_changes = 0
-                
+                optimization_end = time.time()
+                integrate_start = time.time()
                 learned_vector_field = flow.get_equivariant_field(flow.base_function, flow_optimizer.params)
                 transformed_pattern = apply_pattern_flow(pattern, flow, learned_vector_field)
-                
+                integrate_end = time.time()
                 # Clear and reuse the same axes
+                rendering_start = time.time()
                 ax.clear()
                 plot_tiling(transformed_pattern, ax=ax)
                 fig.canvas.draw()
                 plt.pause(0.01)  # Small pause to allow GUI to update
-        
+                rendering_end = time.time()
         # Display the webcam feed with points
-        cv2.imshow("Webcam Segmentation", blended)
-        key = cv2.waitKey(1) & 0xFF
+        # cv2.imshow("Webcam Segmentation", blended)
+        # key = cv2.waitKey(1) & 0xFF
+
+        end_time = time.time()  # End timing the loop
+
+        # Print out the timing results
+        if process_this_frame:
+            print(f"Frame Capture Time: {frame_capture_end - frame_capture_start:.4f} seconds")
+            print(f"Segmentation Time: {segmentation_end - segmentation_start:.4f} seconds")
+            print(f"Preprocess Time: {preprocess_end - preprocess_start:.4f} seconds")
+            print(f"Integration Time: {integrate_end - integrate_start:.4f} seconds")
+        print(f"Rendering Time: {rendering_end - rendering_start:.4f} seconds")
+        print(f"Optimization Time: {optimization_end - optimization_start:.4f} seconds")
+        print(f"Total Loop Time: {end_time - start_time:.4f} seconds")
 
 if __name__ == "__main__":
     main()
