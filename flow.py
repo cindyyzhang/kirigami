@@ -27,7 +27,7 @@ class EquivariantFlow:
         self.config = config
         self.operations = jnp.array([jnp.array(sympy_to_numpy(op)) 
                                    for op in plane_group.operations])
-        self.base_function, self.params = self.create_vector_field(jrnd.PRNGKey(200))
+        self.base_function, self.params = self.create_vector_field(jrnd.PRNGKey(42))
         
     def create_vector_field(self, rng_key: jrnd.PRNGKey) -> Tuple[Callable, dict]:
         """Creates a random vector field with the specified symmetries"""
@@ -64,6 +64,7 @@ class EquivariantFlow:
         """
         Integrates the flow up to different times based on x-coordinate.
         Points further right will be integrated for longer times.
+        Uses a single integration and selects appropriate timesteps.
         """
         # Normalize x-coordinates to [0, 1]
         x_coords = points[..., 0]  # Shape: (B, N)
@@ -72,17 +73,20 @@ class EquivariantFlow:
         normalized_x = (x_coords - min_x) / (max_x - min_x)  # Shape: (B, N)
         
         # Map to integration end times for each point
-        start_t = start_time
-        end_t = end_time
-        integration_times = start_t + normalized_x * (end_t - start_t)  # Shape: (B, N)
+        integration_times = start_time + normalized_x * (end_time - start_time)  # Shape: (B, N)
         
-        # For each point, integrate up to its specific time
-        def integrate_point(point, end_time):
-            times = jnp.linspace(0, end_time, self.config.num_steps)
-            trajectory = odeint(lambda xy, t: vector_field(xy, t), point, times)
-            return trajectory[-1]  # Return final position
+        # Integrate all points to the end time
+        times = jnp.linspace(0, end_time, self.config.num_steps)
+        all_trajectories = odeint(lambda xy, t: vector_field(xy, t), points, times)  # Shape: (T, B, N, 2)
         
-        transformed_points = jax.vmap(jax.vmap(integrate_point))(points, integration_times)
+        # Find closest time index for each point
+        time_indices = jnp.round(integration_times * (self.config.num_steps - 1) / end_time).astype(jnp.int32)
+        
+        # Select the appropriate timestep for each point
+        batch_indices = jnp.arange(points.shape[0])[:, None]
+        point_indices = jnp.arange(points.shape[1])[None, :]
+        transformed_points = all_trajectories[time_indices, batch_indices, point_indices]
+        
         return transformed_points
 
     def integrate(self, vector_field: Callable, initial_points: jnp.ndarray) -> jnp.ndarray:
