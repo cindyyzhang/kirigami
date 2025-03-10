@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 from torchvision import transforms as T
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
-from jaxopt import LBFGS
+from jaxopt import LBFGS, OptaxSolver
+import optax
 import os
 import time
 
@@ -97,6 +98,31 @@ def preprocess_boundary_points(points):
     normalized_points = centered_points * scale_factor
     return normalized_points
 
+def compute_polygon_area(points):
+    """
+    Compute the area of a polygon using the Shoelace formula.
+    
+    Args:
+        points: A jax.numpy array of shape (N, 2) containing the coordinates of the polygon vertices.
+        
+    Returns:
+        The area of the polygon.
+    """
+    # Ensure points is a jax array
+    points = jnp.asarray(points)
+    
+    # Extract x and y coordinates
+    x = points[:, 0]
+    y = points[:, 1]
+    
+    # Shift coordinates to compute next pair (wrap around to the first point)
+    x_next = jnp.roll(x, -1)
+    y_next = jnp.roll(y, -1)
+    
+    # Apply Shoelace formula
+    area = 0.5 * jnp.abs(jnp.sum(x * y_next - x_next * y))
+    return area
+
 class FlowOptimizer:
     """Wrapper class to handle optimization with changing target points"""
     def __init__(self, flow, tile_points, init_params):
@@ -127,19 +153,29 @@ class FlowOptimizer:
             
             # Scale and center
             centroid_T = jnp.mean(final_points, axis=0)
-            centroid_P = jnp.mean(target_points, axis=0)
             scale_T = jnp.mean(jnp.linalg.norm(final_points - centroid_T, axis=1))
-            scale_P = jnp.mean(jnp.linalg.norm(target_points - centroid_P, axis=1))
-            T_scaled = (final_points - centroid_T) * (scale_P / scale_T) + centroid_P
-            
-            # Compute costs for all possible cyclic shifts
+            scale_P = jnp.mean(jnp.linalg.norm(target_points, axis=1))
+            T_scaled = (final_points - centroid_T) * (scale_P / scale_T)
+
             def compute_shift_cost(shift):
                 shifted_target = jnp.roll(target_points, shift, axis=0)
                 return jnp.sum((T_scaled - shifted_target) ** 2)
             
             shifts = jnp.arange(len(target_points))
             all_costs = jax.vmap(compute_shift_cost)(shifts)
-            return jnp.min(all_costs)
+            mse_loss = jnp.min(all_costs)
+            
+            # Add regularization to prevent degenerate solutions
+            # 1. Smoothness regularization on the parameters
+            reg_loss = jnp.sum(params**2) * 0.001
+            
+            # 2. Area preservation regularization
+            # This prevents collapse or extreme stretching
+            # area_before = compute_polygon_area(self.tile_points)
+            # area_after = compute_polygon_area(final_points)
+            # area_loss = jnp.abs(area_after/area_before - 1.0) * 10.0
+            
+            return mse_loss + reg_loss
             
         self.loss_fn = flow_loss
         self.current_target = None
@@ -149,7 +185,13 @@ class FlowOptimizer:
             target = self.current_target if self.current_target is not None else dummy_target
             return self.loss_fn(params, target)
         
-        self.optimizer = LBFGS(fun=opt_wrapper, maxiter=50, tol=1e-6)
+        # Adam optimizer configuration
+        learning_rate = 0.02
+        adam_optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),  # Add gradient clipping for stability
+            optax.adam(learning_rate)
+        )
+        self.optimizer = OptaxSolver(opt=adam_optimizer, fun=opt_wrapper)
         self.opt_state = self.optimizer.init_state(init_params)
         self.params = init_params
         self.initial_params = init_params
@@ -168,7 +210,7 @@ class FlowOptimizer:
 
     def reset_optimizer(self):
         """
-        Resets the LBFGS optimizer state with the initial parameters.
+        Resets the optimizer state with the initial parameters.
         """
         self.params = self.initial_params
         self.opt_state = self.optimizer.init_state(self.params)
@@ -239,10 +281,10 @@ def main():
     
     # Variables to track optimization progress
     optimization_steps = 0
-    reset_every_n_steps = 50  # Reset optimizer every 50 steps
+    reset_every_n_steps = 100  # Reset optimizer less frequently for Adam
     consecutive_small_changes = 0
-    small_change_threshold = 0.001  # Parameter change threshold
-    max_consecutive_small_changes = 10  # Reset after this many small changes
+    small_change_threshold = 0.001  # Lower threshold for Adam
+    max_consecutive_small_changes = 10  # Allow more small changes before reset
     
     # prevent_display_sleep()
     
@@ -307,16 +349,16 @@ def main():
                 last_boundary_points = None
         segmentation_end = time.time()
 
-        # if last_mask is not None:
-        #     if mask_overlay is None or mask_overlay.shape != frame.shape:
-        #         mask_overlay = np.zeros_like(frame, dtype=np.uint8)
-        #     else:
-        #         mask_overlay.fill(0)  # Clear the buffer
+        if last_mask is not None:
+            if mask_overlay is None or mask_overlay.shape != frame.shape:
+                mask_overlay = np.zeros_like(frame, dtype=np.uint8)
+            else:
+                mask_overlay.fill(0)  # Clear the buffer
                 
-        #     mask_overlay[last_mask] = (0, 255, 0)  # Green color in BGR
-        #     blended = cv2.addWeighted(frame, 1.0, mask_overlay, 0.5, 0)
-        # else:
-        #     blended = frame
+            mask_overlay[last_mask] = (0, 255, 0)  # Green color in BGR
+            blended = cv2.addWeighted(frame, 1.0, mask_overlay, 0.5, 0)
+        else:
+            blended = frame
 
         if process_this_frame and last_boundary_points is not None:
             preprocess_start = time.time()
@@ -326,6 +368,7 @@ def main():
                 # Update the flow optimizer with the new target points
                 optimization_start = time.time()
                 params, loss, param_diff = flow_optimizer.update(person_points)
+                print(f"Loss: {loss:.4f}")
                 optimization_steps += 1
 
                 if param_diff < small_change_threshold:
@@ -354,8 +397,8 @@ def main():
                 plt.pause(0.01)  # Small pause to allow GUI to update
                 rendering_end = time.time()
         # Display the webcam feed with points
-        # cv2.imshow("Webcam Segmentation", blended)
-        # key = cv2.waitKey(1) & 0xFF
+        cv2.imshow("Webcam Segmentation", blended)
+        key = cv2.waitKey(1) & 0xFF
 
         end_time = time.time()  # End timing the loop
 
