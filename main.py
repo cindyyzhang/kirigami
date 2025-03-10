@@ -196,16 +196,41 @@ class FlowOptimizer:
         self.params = init_params
         self.initial_params = init_params
 
-    def update(self, target_points):
-        """Perform one optimization step with new target points"""
+    def update(self, target_points, num_steps=1):
+        """
+        Perform multiple optimization steps with new target points
+        
+        Args:
+            target_points: Target points to match
+            num_steps: Number of optimization steps to perform
+            
+        Returns:
+            params: Updated parameters
+            loss: Final loss value
+            param_diff: Mean absolute parameter difference
+        """
         self.current_target = target_points
         old_params = self.params
-        self.params, self.opt_state = self.optimizer.update(
-            self.params,
-            self.opt_state
+        
+        # Define a single step function that can be JIT-compiled
+        @jax.jit
+        def step_fn(carry, _):
+            params, opt_state = carry
+            params, opt_state = self.optimizer.update(params, opt_state)
+            return (params, opt_state), None
+        
+        # Use scan to efficiently perform multiple steps
+        (self.params, self.opt_state), _ = jax.lax.scan(
+            step_fn, 
+            (self.params, self.opt_state), 
+            None, 
+            length=num_steps
         )
+        
+        # Compute metrics after all steps
         param_diff = jnp.abs(self.params - old_params).mean()
         loss = self.loss_fn(self.params, target_points)
+        
         return self.params, loss, param_diff
 
     def reset_optimizer(self):
@@ -367,7 +392,7 @@ def main():
             if person_points is not None:
                 # Update the flow optimizer with the new target points
                 optimization_start = time.time()
-                params, loss, param_diff = flow_optimizer.update(person_points)
+                params, loss, param_diff = flow_optimizer.update(person_points, num_steps=5)
                 print(f"Loss: {loss:.4f}")
                 optimization_steps += 1
 
